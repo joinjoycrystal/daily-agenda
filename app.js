@@ -1,0 +1,38 @@
+import {initializeApp} from 'https://www.gstatic.com/firebasejs/11.10.0/firebase-app.js';
+import {getAuth,signInWithEmailAndPassword,onAuthStateChanged,signOut,setPersistence,browserSessionPersistence} from 'https://www.gstatic.com/firebasejs/11.10.0/firebase-auth.js';
+import {getFirestore,collection,query,where,getDocs,doc,setDoc,getDocFromServer,orderBy,limit} from 'https://www.gstatic.com/firebasejs/11.10.0/firebase-firestore.js';
+import {config} from './config.js';import {localDay,badge,selectTasks,validateReport,receiptLabel} from './logic.js';
+const $=id=>document.getElementById(id);let auth,db,tasks=[],reports=[],selected=null,pending=null,timer=null,loading=false;
+const node=(tag,text,cls)=>{const e=document.createElement(tag);if(text!==undefined)e.textContent=text;if(cls)e.className=cls;return e;};
+function errorText(e){return ({'auth/invalid-credential':'帳號或工作台密碼不正確。','auth/operation-not-allowed':'請先在 Firebase 開啟 Email/Password 登入。','auth/too-many-requests':'登入過於頻繁，請稍後重試。','permission-denied':'權限不足，請檢查主管 UID 與 Firestore 規則。','unavailable':'網路暫時無法連線，請稍後重試。'})[e.code]||'操作未完成，請檢查網路與設定後重試。';}
+function base(){return `users/${config.managerUid}/spaces/${config.space}`;}
+function render(){
+ const filtered=selectTasks(tasks,{day:$('day').value,owner:$('owner').value,scope:$('scope').value,showDone:$('showDone').checked});$('tasks').replaceChildren();$('stats').replaceChildren(node('span',`顯示 ${filtered.length} 項`,'pill'),node('span',`逾期 ${tasks.filter(t=>badge(t)[0]==='overdue').length} 項`,'pill'),node('span',`待補資料 ${tasks.filter(t=>badge(t)[0]==='missing').length} 項`,'pill'));
+ let group=null;for(const t of filtered){if(group!==t.owner){group=t.owner;$('tasks').append(node('h2',group||'未分派','group'));}const [cls,label]=badge(t),card=node('article',undefined,'card '+cls);card.append(node('div',`${t.day||'未排日期'}　${t.time||'全天'}　｜　${label}`,'meta'),node('h3',t.title),node('div',[t.customer,t.caseNo,t.type].filter(Boolean).join('｜'),'meta'));if(t.location)card.append(node('div','地點：'+t.location,'meta'));if(t.note)card.append(node('p',t.note,'notes'));const b=node('button','查看／回報');b.onclick=()=>edit(t);card.append(b);$('tasks').append(card);}
+ if(!filtered.length)$('tasks').append(node('p','此範圍沒有已同步事項；若資料不符，請先在電腦執行手機同步。','notice'));
+ $('reports').replaceChildren();for(const r of reports){const e=node('div',undefined,'receipt');e.append(node('strong',receiptLabel(r.state)),node('div',`事項 ${r.taskId}｜${r.clientAt?new Date(r.clientAt).toLocaleString('zh-TW'):''}`,'meta'),node('p',r.result),node('div',r.detail||'等待電腦接收','meta'));$('reports').append(e);}if(!reports.length)$('reports').append(node('p','尚無回報。'));
+}
+async function refresh(){if(!auth?.currentUser||loading||document.hidden)return;loading=true;$('refresh').disabled=true;try{
+ const [a,b]=await Promise.all([getDocs(query(collection(db,base()+'/tasks'),where('active','==',true))),getDocs(query(collection(db,base()+'/reports'),orderBy('clientAt','desc'),limit(50)))]);
+ tasks=a.docs.map(x=>x.data());reports=b.docs.map(x=>({...x.data(),id:x.id}));const keep=$('owner').value,people=new Map(tasks.map(t=>[String(t.ownerId||0),t.owner||'未分派']));$('owner').replaceChildren(new Option('全體人員',''));for(const [id,name]of [...people].sort((a,b)=>a[1].localeCompare(b[1],'zh-Hant')))$('owner').add(new Option(name,id));$('owner').value=people.has(keep)?keep:'';
+ $('connection').textContent='已連線｜'+auth.currentUser.email;$('syncInfo').textContent='雲端讀取時間 '+new Date().toLocaleString('zh-TW')+'。電腦資料需經 DAILY 同步後才會更新。';render();
+ }catch(e){$('syncInfo').textContent=errorText(e);}finally{loading=false;$('refresh').disabled=false;}}
+function edit(t){if(localStorage.getItem('dailyPending:'+config.space)){recover();$('syncInfo').textContent='請先重送待確認回報，再填寫下一筆，避免遺漏。';return;}selected=t;pending=null;$('editTitle').textContent=t.title;$('editMeta').textContent=`${t.day} ${t.time}｜${t.owner}｜${t.customer}`;$('editNote').textContent=t.note||'無備註';$('formalWarning').hidden=!t.protected;$('result').value='';$('nextDate').value='';$('nextDate').required=false;$('action').value='紀錄';$('reportError').textContent='';$('submitReport').disabled=false;$('editor').showModal();}
+$('closeEditor').onclick=()=>$('editor').close();$('action').onchange=()=>{$('nextDate').required=$('action').value==='待追蹤';};
+$('reportForm').onsubmit=async e=>{e.preventDefault();$('submitReport').disabled=true;try{
+ const r={taskId:selected.taskId,baseRevision:selected.revision,actorUid:config.managerUid,action:$('action').value,result:$('result').value.trim(),nextDate:$('nextDate').value,clientAt:new Date().toISOString(),state:'pending'};validateReport(r);
+ if(pending&&JSON.stringify({...r,clientAt:pending.data.clientAt})!==JSON.stringify(pending.data))throw Error('UNCERTAIN');
+ if(!pending)pending={id:crypto.randomUUID(),data:r};
+ // Persist the exact report id on this device: retries cannot create duplicate reports.
+ localStorage.setItem('dailyPending:'+config.space,JSON.stringify(pending));$('reportError').textContent='待上傳…已保留在本機，請勿重複送出';
+ const ref=doc(db,base()+'/reports/'+pending.id),old=await getDocFromServer(ref);
+ if(!old.exists())await setDoc(ref,pending.data);
+ localStorage.removeItem('dailyPending:'+config.space);pending=null;$('editor').close();await refresh();
+ }catch(e){$('reportError').textContent=e.message==='UNCERTAIN'?'上一份回報結果尚待確認；請重新整理後用「重送待確認回報」，不要修改重送內容。':e.code?errorText(e):e.message;$('submitReport').disabled=false;}};
+$('loginForm').onsubmit=async e=>{e.preventDefault();$('loginError').textContent='登入中…';try{await signInWithEmailAndPassword(auth,$('email').value.trim(),$('password').value);$('password').value='';$('loginError').textContent='';}catch(e){$('loginError').textContent=errorText(e);}};
+$('logout').onclick=async()=>{if(localStorage.getItem('dailyPending:'+config.space)&&!confirm('還有待確認回報，登出會保留在這台裝置供下次登入重試。確定登出？'))return;await signOut(auth);tasks=[];reports=[];$('tasks').replaceChildren();$('reports').replaceChildren();};
+$('refresh').onclick=refresh;for(const id of ['day','owner','scope','showDone'])$(id).onchange=render;$('day').value=localDay();
+function recover(){document.getElementById('pendingRecovery')?.remove();const saved=localStorage.getItem('dailyPending:'+config.space);if(!saved)return;try{const item=JSON.parse(saved);const box=node('div',undefined,'notice'),b=node('button','重送待確認回報');box.id='pendingRecovery';box.append(node('p','有一筆尚未確認雲端收到的回報。使用相同編號重試，不會重複建立。'),b);$('workspace').prepend(box);b.onclick=async()=>{b.disabled=true;try{const ref=doc(db,base()+'/reports/'+item.id),old=await getDocFromServer(ref);if(!old.exists())await setDoc(ref,item.data);localStorage.removeItem('dailyPending:'+config.space);box.remove();pending=null;await refresh();}catch(e){box.append(node('p',errorText(e)));b.disabled=false;}};}catch{ $('syncInfo').textContent='待送資料格式錯誤，請聯絡維護人員。';}}
+try{if(!config.firebase.apiKey||!config.managerUid||!config.space)throw Error('請先由 DAILY 匯出已設定的手機網頁，再部署到 GitHub Pages。');db=getFirestore(initializeApp(config.firebase));auth=getAuth();await setPersistence(auth,browserSessionPersistence);onAuthStateChanged(auth,async u=>{clearInterval(timer);if(u&&u.uid!==config.managerUid){await signOut(auth);$('loginError').textContent='此帳號沒有主管權限。';return;}$('loginPanel').hidden=!!u;$('workspace').hidden=!u;if(u){recover();await refresh();timer=setInterval(refresh,300000);}else $('connection').textContent='尚未登入';});}catch(e){$('loginError').textContent=e.message;$('loginForm').querySelector('button').disabled=true;}
+window.addEventListener('online',refresh);window.addEventListener('offline',()=>{$('connection').textContent='離線｜未送達回報保留在本機，連線後重試';});
+if('serviceWorker'in navigator)navigator.serviceWorker.register('./sw.js').catch(()=>{});
